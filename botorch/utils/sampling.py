@@ -28,6 +28,7 @@ from botorch.sampling.qmc import NormalQMCEngine
 from scipy.spatial import Delaunay, HalfspaceIntersection
 from torch import LongTensor, Tensor
 from torch.quasirandom import SobolEngine
+from botorch.utils.transforms import unnormalize
 
 
 @contextmanager
@@ -873,3 +874,79 @@ def sparse_to_dense_constraints(
         A[i, indices.long()] = coefficients
         b[i] = rhs
     return A, b
+
+
+def optimize_posterior_samples(
+    paths: SamplePath,
+    bounds: Tensor,
+    candidates: Optional[Tensor] = None,
+    raw_samples: Optional[int] = 1024,
+    num_restarts: Optional[int] = 20,
+    maxiter: int = 50,
+    lr_init: float = 1e-3,
+    maximize: bool = True,
+) -> Tuple[Tensor, Tensor]:
+    r"""Cheaply maximizes posterior samples by random querying followed by vanilla
+    gradient descent on the best num_restarts points.
+
+    Args:
+        paths: Random Fourier Feature-based sample paths from the GP  
+        bounds: The bounds on the search space.
+        candidates: A priori good candidates (typically previous design points)
+            which acts as extra initial guesses for the optimization routine.
+        raw_samples: The number of samples with which to query the samples initially.
+        num_restarts The number of gradient descent steps to use on each of the best 
+        found initial points.
+        maxiter: The maximal permitted number of gradient descent steps.
+        lr: The stepsize of the gradient descent steps.
+
+    Returns:
+        A two-element tuple containing:
+            - A: A `num_optima x batch_size x d`-dim tensor of optimal inputs x*.
+            - b: A `num_optima x batch_size x 1`-dim tensor of optimal outputs f*.
+    """
+    if maximize:
+        path_func = lambda x: paths.forward(x)
+    else:
+        path_func = lambda x: -paths.forward(x) 
+
+    candidate_set = unnormalize(SobolEngine(
+        dimension=bounds.shape[1], scramble=True).draw(raw_samples), bounds)
+    # TODO add spray points
+    # queries all samples on all candidates - output raw_samples * num_objectives * num_optima
+    candidate_queries = path_func(candidate_set)
+    num_optima = candidate_queries.shape[0]
+    batch_size = candidate_queries.shape[1] if candidate_queries.ndim == 3 else 1
+    argtop_candidates = candidate_queries.argsort(dim=-1, descending=True)[
+        ..., 0:num_restarts]
+
+    # These are used as masks when retrieving the argmaxes
+    row_indexer = torch.arange(num_optima * batch_size).to(torch.long)
+
+    X_top_candidates = candidate_set[argtop_candidates,
+                                     :].requires_grad_(requires_grad=True)
+
+    for iter_ in range(maxiter):
+        # Decaying the learing rate - empirically, this has been well-calibrated
+        lr = lr_init / (iter_ + 1)
+        per_sample_outputs = path_func(X_top_candidates)
+        grads = torch.autograd.grad(
+            per_sample_outputs, X_top_candidates, grad_outputs=torch.ones_like(per_sample_outputs))[0]
+        X_top_candidates = torch.clamp(
+            X_top_candidates + lr * grads, bounds[0], bounds[1])  # TODO fix bounds here
+
+    per_sample_outputs = path_func(X_top_candidates).reshape(
+        num_optima * batch_size, num_restarts)
+    sample_argmax = torch.max(per_sample_outputs, dim=-1, keepdims=True)[1].flatten()
+    X_top_candidates_flat = X_top_candidates.reshape(
+        num_optima * batch_size, num_restarts, -1)
+
+    X_opt = X_top_candidates_flat[row_indexer,
+                                  sample_argmax].reshape(num_optima, batch_size, -1)
+    f_opt = per_sample_outputs.max(axis=-1).values.reshape(num_optima, batch_size, 1)
+
+    # if we minimize, then we have now found the negative minimum, needs to be flipped.
+    if not maximize:
+        f_opt = (-1) * f_opt
+
+    return X_opt.detach(), f_opt.detach()

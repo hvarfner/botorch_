@@ -312,7 +312,7 @@ class SaasPyroModel(PyroModel):
 class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
     r"""A fully Bayesian single-task GP model with the SAAS prior.
 
-    This model assumes that the inputs have been normalized to [0, 1]^d and that
+    This model assumes that the inputs have been normalized to [0, 1]^d and thatcdcd
     the output has been standardized to have zero mean and unit variance. You can
     either normalize and standardize the data before constructing the model or use
     an `input_transform` and `outcome_transform`. The SAAS model [Eriksson2021saasbo]_
@@ -335,6 +335,10 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
         outcome_transform: Optional[OutcomeTransform] = None,
         input_transform: Optional[InputTransform] = None,
         pyro_model: Optional[PyroModel] = None,
+        num_samples: int = 256,
+        warmup: int = 128,
+        thinning: int = 16,
+        disable_progbar: bool = False
     ) -> None:
         r"""Initialize the fully Bayesian single-task GP model.
 
@@ -350,19 +354,7 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
                 forward pass.
             pyro_model: Optional `PyroModel`, defaults to `SaasPyroModel`.
         """
-        if not (
-            train_X.ndim == train_Y.ndim == 2
-            and len(train_X) == len(train_Y)
-            and train_Y.shape[-1] == 1
-        ):
-            raise ValueError(
-                "Expected train_X to have shape n x d and train_Y to have shape n x 1"
-            )
-        if train_Yvar is not None:
-            if train_Y.shape != train_Yvar.shape:
-                raise ValueError(
-                    "Expected train_Yvar to be None or have the same shape as train_Y"
-                )
+        
         with torch.no_grad():
             transformed_X = self.transform_inputs(
                 X=train_X, input_transform=input_transform
@@ -373,8 +365,20 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
         validate_input_scaling(
             train_X=transformed_X, train_Y=train_Y, train_Yvar=train_Yvar
         )
+        self._input_batch_shape, self._aug_batch_shape = self.get_batch_dimensions(
+            train_X=train_X, train_Y=train_Y
+        )
+        num_mcmc_samples = num_samples // thinning
+        if pyro_model is None:
+            pyro_model = SaasPyroModel()
+        
+        pyro_model.set_inputs(
+            train_X=transformed_X, train_Y=train_Y, train_Yvar=train_Yvar
+        )
+        self.pyro_model = pyro_model
+        train_X = train_X.unsqueeze(0).expand(num_mcmc_samples, train_X.shape[0], -1)
+        train_Y = train_Y.unsqueeze(0).expand(num_mcmc_samples, train_Y.shape[0], -1)
         self._num_outputs = train_Y.shape[-1]
-        self._input_batch_shape = train_X.shape[:-2]
         if train_Yvar is not None:  # Clamp after transforming
             train_Yvar = train_Yvar.clamp(MIN_INFERRED_NOISE_LEVEL)
 
@@ -385,16 +389,15 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
         self.mean_module = None
         self.covar_module = None
         self.likelihood = None
-        if pyro_model is None:
-            pyro_model = SaasPyroModel()
-        pyro_model.set_inputs(
-            train_X=transformed_X, train_Y=train_Y, train_Yvar=train_Yvar
-        )
-        self.pyro_model = pyro_model
         if outcome_transform is not None:
             self.outcome_transform = outcome_transform
         if input_transform is not None:
             self.input_transform = input_transform
+        self.num_samples = num_samples
+        self.warmup = warmup
+        self.thinning = thinning
+        self.disable_progbar = disable_progbar
+        #self.num_batch = num_mcmc_samples
 
     def _check_if_fitted(self):
         r"""Raise an exception if the model hasn't been fitted."""
@@ -423,14 +426,6 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
         Note that `SaasFullyBayesianSingleTaskGP` does not support batching
         over input data at this point."""
         return torch.Size([self.num_mcmc_samples])
-
-    @property
-    def _aug_batch_shape(self) -> torch.Size:
-        r"""The batch shape of the model, augmented to include the output dim."""
-        aug_batch_shape = self.batch_shape
-        if self.num_outputs > 1:
-            aug_batch_shape += torch.Size([self.num_outputs])
-        return aug_batch_shape
 
     def train(self, mode: bool = True) -> None:
         r"""Puts the model in `train` mode."""
@@ -495,9 +490,8 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
         rest of this method will not run.
         """
         self._check_if_fitted()
-        x = X.unsqueeze(MCMC_DIM)
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
+        mean_x = self.mean_module(X)
+        covar_x = self.covar_module(X)
         return MultivariateNormal(mean_x, covar_x)
 
     # pyre-ignore[14]: Inconsistent override
@@ -529,12 +523,15 @@ class SaasFullyBayesianSingleTaskGP(ExactGP, BatchedMultiOutputGPyTorchModel):
             A `FullyBayesianPosterior` object. Includes observation noise if specified.
         """
         self._check_if_fitted()
+        #X_batch = X.unsqueeze(0).repeat(self.num_batch, 1, 1, 1)
         posterior = super().posterior(
-            X=X,
+            X=X.unsqueeze(MCMC_DIM),
             output_indices=output_indices,
             observation_noise=observation_noise,
             posterior_transform=posterior_transform,
             **kwargs,
         )
         posterior = FullyBayesianPosterior(distribution=posterior.distribution)
+
         return posterior
+

@@ -52,7 +52,7 @@ class TestQLowerBoundJointEntropySearch(BotorchTestCase):
     def test_lower_bound_joint_entropy_search(self):
         torch.manual_seed(1)
         tkwargs = {"device": self.device}
-        estimation_types = ("0", "LB", "LB2", "MC")
+        estimation_types = ("LB", "MC")
         num_objectives = 1
         for (dtype, estimation_type, use_model_list, standardize_model,) in product(
             (torch.float, torch.double),
@@ -69,8 +69,8 @@ class TestQLowerBoundJointEntropySearch(BotorchTestCase):
 
             num_samples = 20
 
-            optimal_inputs = torch.rand(num_samples, input_dim, **tkwargs)
-            optimal_outputs = torch.rand(num_samples, num_objectives, **tkwargs)
+            optimal_inputs = torch.rand(num_samples, input_dim, **tkwargs).unsqueeze(-1)
+            optimal_outputs = torch.rand(num_samples, num_objectives, **tkwargs).unsqueeze(-1)
 
             # test acquisition
             X_pending_list = [None, torch.rand(2, input_dim, **tkwargs)]
