@@ -71,9 +71,10 @@ class qLowerBoundJointEntropySearch(AcquisitionFunction, MCSamplerMixin):
                 set of objectives of dimension `1`.
             condition_noiseless:
             posterior_transform:
-            estimation_type: estimation_type: A string to determine which entropy estimate is
-                computed: Lower bound" (LB) or "Monte Carlo" (MC). Lower Bound is recommended
-                due to the relatively high variance of the MC estimator.
+            estimation_type: estimation_type: A string to determine which entropy
+                estimate is computed: Lower bound" (LB) or "Monte Carlo" (MC). 
+                Lower Bound is recommended due to the relatively high variance 
+                of the MC estimator.
             maximize: If true, we consider a maximization problem.
             X_pending: A `m x d`-dim Tensor of `m` design points that have been
                 submitted for function evaluation, but have not yet been evaluated
